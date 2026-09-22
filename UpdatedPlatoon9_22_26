@@ -1,0 +1,1269 @@
+---
+title: "UpdatedSplitsProj"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+library(RMySQL)
+library(DBI)
+
+
+# Connect to MySQL
+con <- dbConnect(
+  RMySQL::MySQL(),
+  host = "localhost",
+  dbname = "baseball_platoon",
+  user = "root",
+  password = ""
+)
+
+platoon_data <- dbGetQuery(con, "SELECT * FROM platoon_splits")
+
+dbDisconnect(con)
+colnames(platoon_data)
+```
+
+```{r}
+con <- dbConnect(
+  RMySQL::MySQL(),
+  host = "localhost",
+  dbname = "baseball_platoon",
+  user = "root",
+  password = ""
+  # Remove client.flag entirely
+)
+
+setwd("~/Desktop/splits_csv/")
+
+years <- 2021:2025
+hands <- c("RHP")
+
+for (year in years) {
+  for (hand in hands) {
+    
+    standard_file <- paste0(year, "splitsvs", hand, ".csv")
+    advanced_file <- paste0(year, "Advsplitsvs", hand, ".csv")
+    
+    print(paste("=== Processing:", year, "vs", hand, "==="))
+    
+    standard <- read_csv(standard_file, show_col_types = FALSE)
+    advanced <- read_csv(advanced_file, show_col_types = FALSE)
+    
+    combined <- standard %>%
+      left_join(
+        advanced %>% select(-Season, -PA, -AVG, -Tm),
+        by = c("playerId", "Name")
+      ) %>%
+      rename(
+        player_id = playerId,
+        player_name = Name,
+        team_name = Tm,
+        K_pct = `K%`,
+        BB_pct = `BB%`,
+        BB_K_ratio = `BB/K`,
+        wRC_plus = `wRC+`,
+        singles = `1B`,
+        doubles = `2B`,
+        triples = `3B`
+      ) %>%
+      mutate(
+        year = year,
+        pitcher_hand = hand
+      ) %>%
+      select(
+        player_id, player_name, year, pitcher_hand, team_name,
+        PA, AB, H, singles, doubles, triples, HR, R, RBI,
+        BB, IBB, SO, HBP, SF, SH, GDP, SB, CS,
+        AVG, OBP, SLG, OPS, wOBA, ISO,
+        K_pct, BB_pct, BABIP, wRC_plus, BB_K_ratio
+      )
+    
+    tryCatch({
+      dbWriteTable(con, "player_stats", combined,
+                   append = TRUE, row.names = FALSE)
+      print(paste("Successfully loaded", nrow(combined), "rows"))
+    }, error = function(e) {
+      print(paste("Error:", e$message))
+    })
+  }
+}
+
+dbGetQuery(con, "
+  SELECT year, pitcher_hand, COUNT(*) as players
+  FROM player_stats
+  GROUP BY year, pitcher_hand
+  ORDER BY year, pitcher_hand
+")
+
+```
+
+```{r}
+dbExecute(con, "SET GLOBAL local_infile = 1")
+```
+
+```{r}
+all_rhp_data <- list()
+
+setwd("~/Desktop/splits_csv/")
+
+for (year in 2021:2025) {
+  standard <- read_csv(paste0(year, "splitsvsRHP.csv"), show_col_types = FALSE)
+  advanced <- read_csv(paste0(year, "AdvsplitsvsRHP.csv"), show_col_types = FALSE)
+  
+  combined <- standard %>%
+    left_join(advanced %>% select(-Season, -PA, -AVG, -Tm),
+              by = c("playerId", "Name")) %>%
+    rename(
+      player_id = playerId, player_name = Name, team_name = Tm,
+      K_pct = `K%`, BB_pct = `BB%`, BB_K_ratio = `BB/K`,
+      wRC_plus = `wRC+`, singles = `1B`, doubles = `2B`, triples = `3B`
+    ) %>%
+    mutate(year = year, pitcher_hand = "RHP") %>%
+    select(player_id, player_name, year, pitcher_hand, team_name,
+           PA, AB, H, singles, doubles, triples, HR, R, RBI,
+           BB, IBB, SO, HBP, SF, SH, GDP, SB, CS,
+           AVG, OBP, SLG, OPS, wOBA, ISO,
+           K_pct, BB_pct, BABIP, wRC_plus, BB_K_ratio)
+  
+  all_rhp_data[[as.character(year)]] <- combined
+  print(paste("Read", year, "RHP:", nrow(combined), "rows"))
+}
+
+all_rhp_combined <- bind_rows(all_rhp_data)
+cat("Total RHP rows to insert:", nrow(all_rhp_combined), "\n")
+
+DBI::dbWriteTable(con, "player_stats", all_rhp_combined, 
+                  append = TRUE, row.names = FALSE)
+
+cat("Successfully loaded all RHP data\n")
+
+dbGetQuery(con, "
+  SELECT year, pitcher_hand, COUNT(*) as players
+  FROM player_stats
+  GROUP BY year, pitcher_hand
+  ORDER BY year, pitcher_hand
+")
+```
+
+```{r}
+# Add calculated metrics
+platoon_analysis <- platoon_data %>%
+  mutate(
+    # Platoon advantage magnitude
+    platoon_advantage = abs(wOBA_diff),
+    
+    # Which side they hit better
+    better_vs = ifelse(wOBA_diff > 0, "LHP", "RHP"),
+    
+    # Overall wOBA (weighted by PA)
+    overall_wOBA = (wOBA_vs_LHP * PA_vs_LHP + wOBA_vs_RHP * PA_vs_RHP) / total_PA,
+    
+    # Platoon usage ratio (0-1, where 0.5 = perfectly balanced)
+    platoon_usage_LHP = PA_vs_LHP / total_PA,
+    platoon_usage_RHP = PA_vs_RHP / total_PA,
+    
+    # Classify platoon severity
+    platoon_category = case_when(
+      platoon_advantage >= 0.070 ~ "Extreme",
+      platoon_advantage >= 0.040 ~ "Strong",
+      platoon_advantage >= 0.020 ~ "Moderate",
+      TRUE ~ "Minimal"
+    ),
+    
+    # Identify if they're being used "optimally"
+    # Heuristic: if you're much better vs LHP, you should face LHP more
+    optimal_usage = case_when(
+      wOBA_diff > 0.040 & platoon_usage_LHP < 0.30 ~ "Underused_vs_LHP",
+      wOBA_diff < -0.040 & platoon_usage_RHP < 0.30 ~ "Underused_vs_RHP",
+      platoon_advantage < 0.030 ~ "No_platoon_needed",
+      TRUE ~ "Reasonable"
+    )
+  )
+# Summary statistics
+platoon_analysis %>%
+  group_by(year, platoon_category) %>%
+  summarize(
+    n_players = n(),
+    avg_advantage = mean(platoon_advantage),
+    .groups = "drop"
+  )
+```
+
+```{r}
+# Find players with extreme splits who aren't being platooned
+misused_players <- platoon_analysis %>%
+  filter(
+    year == 2025,
+    platoon_category %in% c("Extreme", "Strong"),
+    optimal_usage != "Reasonable"
+  ) %>%
+  arrange(desc(platoon_advantage))
+
+# View the results
+misused_players %>%
+  select(player_name, platoon_category, wOBA_diff, 
+         PA_vs_LHP, PA_vs_RHP, optimal_usage) %>%
+  head(20)
+```
+
+```{r}
+# Scatter plot: Performance vs LHP vs RHP
+ggplot(platoon_analysis %>% filter(year == 2025), 
+       aes(x = wOBA_vs_RHP, y = wOBA_vs_LHP, color = platoon_category)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c("Extreme" = "red", "Strong" = "orange", 
+                                 "Moderate" = "yellow", "Minimal" = "gray")) +
+  labs(
+    title = "2025 MLB Platoon Splits Distribution",
+    subtitle = "Points above line = better vs LHP, below = better vs RHP",
+    x = "wOBA vs RHP",
+    y = "wOBA vs LHP",
+    color = "Platoon Severity"
+  ) +
+  theme_minimal()
+
+# Distribution of platoon advantages
+ggplot(platoon_analysis %>% filter(year == 2025), 
+       aes(x = wOBA_diff)) +
+  geom_histogram(binwidth = 0.01, fill = "steelblue", alpha = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Distribution of Platoon Advantages (2024)",
+    subtitle = "Positive = better vs LHP, Negative = better vs RHP",
+    x = "wOBA Difference (vs LHP - vs RHP)",
+    y = "Number of Players"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# First, calculate league average wOBA for each year
+league_wOBA <- platoon_analysis %>%
+  group_by(year) %>%
+  summarize(
+    league_avg_wOBA = weighted.mean(overall_wOBA, total_PA, na.rm = TRUE)
+  )
+
+# wOBA scale factor (typically 1.15-1.25, varies by year)
+
+wOBA_scales <- data.frame(
+  year = 2021:2025,
+  wOBA_scale = c(1.253, 1.181, 1.206, 1.214, 1.220)  # Approximate values
+)
+
+value_calculation <- platoon_analysis %>%
+  filter(year == 2025) %>%
+  left_join(league_wOBA, by = "year") %>%
+  left_join(wOBA_scales, by = "year") %>%
+  
+  mutate(
+    # Calculate "optimal" PA distribution
+    optimal_PA_good = case_when(
+      platoon_category == "Extreme" ~ total_PA * 0.70,
+      platoon_category == "Strong" ~ total_PA * 0.60,
+      TRUE ~ total_PA * 0.50
+    ),
+    
+    optimal_PA_bad = total_PA - optimal_PA_good,
+    
+    # Actual PA in good vs bad matchup
+    actual_PA_good = ifelse(wOBA_diff > 0, PA_vs_LHP, PA_vs_RHP),
+    actual_PA_bad = ifelse(wOBA_diff > 0, PA_vs_RHP, PA_vs_LHP),
+    
+    # wOBA in good vs bad matchup
+    wOBA_good = ifelse(wOBA_diff > 0, wOBA_vs_LHP, wOBA_vs_RHP),
+    wOBA_bad = ifelse(wOBA_diff > 0, wOBA_vs_RHP, wOBA_vs_LHP),
+    
+    # Expected wOBA under optimal deployment
+    expected_wOBA_optimal = (wOBA_good * optimal_PA_good + wOBA_bad * optimal_PA_bad) / total_PA,
+    
+    # Actual wOBA (already calculated)
+    actual_wOBA = overall_wOBA,
+    
+    # Calculate wRAA for actual usage
+    wRAA_actual = ((actual_wOBA - league_avg_wOBA) / wOBA_scale) * total_PA,
+    
+    # Calculate wRAA for optimal usage
+    wRAA_optimal = ((expected_wOBA_optimal - league_avg_wOBA) / wOBA_scale) * total_PA,
+    
+    # Platoon Value Added = difference in runs
+    platoon_runs_added = wRAA_optimal - wRAA_actual,
+    
+    # Convert to wins (10 runs ≈ 1 win)
+    platoon_wins_added = platoon_runs_added / 10
+  )
+
+total_value_lost <- value_calculation %>%
+  filter(platoon_runs_added > 0) %>%
+  summarize(
+    total_players = n(),
+    total_runs = sum(platoon_runs_added),
+    total_wins = sum(platoon_runs_added) / 10,
+    avg_runs_per_player = mean(platoon_runs_added)
+  )
+
+print(total_value_lost)
+```
+
+```{r}
+# Top 20 most misused players
+player_value_lost <- value_calculation %>%
+  filter(platoon_runs_added > 0) %>%
+  select(
+    player_name, team_name, 
+    year,platoon_category, wOBA_diff, actual_PA_good, actual_PA_bad,
+    optimal_PA_good, optimal_PA_bad,
+    actual_wOBA, expected_wOBA_optimal,
+    platoon_runs_added, platoon_wins_added
+  ) %>%
+  arrange(desc(platoon_runs_added))
+
+head(player_value_lost, 50)
+```
+
+```{r}
+# Value lost by severity of platoon split
+category_analysis <- value_calculation %>%
+  filter(runs_added > 0) %>%
+  group_by(platoon_category) %>%
+  summarize(
+    players = n(),
+    total_runs_lost = sum(platoon_runs_added),
+    avg_runs_per_player = mean(platoon_runs_added)
+  )
+
+print(category_analysis)
+```
+
+```{r}
+# Which teams are leaving the most value on the table?
+team_value_lost <- value_calculation %>%
+  filter(platoon_runs_added > 0) %>%
+  group_by(team_name) %>%
+  summarize(
+    players_misused = n(),
+    total_runs_lost = sum(platoon_runs_added),
+    wins_lost = sum(platoon_runs_added) / 10,
+    avg_runs_per_player = mean(platoon_runs_added)
+  ) %>%
+  arrange(desc(wins_lost))
+
+# Top 10 worst teams at platoon management
+head(team_value_lost, 10)
+```
+
+```{r}
+# Create summary for your report
+summary_2025 <- platoon_analysis %>%
+  filter(year == 2025) %>%
+  summarize(
+    total_players = n(),
+    extreme_platoon = sum(platoon_category == "Extreme"),
+    strong_platoon = sum(platoon_category == "Strong"),
+    avg_platoon_advantage = mean(platoon_advantage),
+    median_platoon_advantage = median(platoon_advantage),
+    misused_players = sum(optimal_usage %in% c("Underused_vs_LHP", "Underused_vs_RHP"))
+  )
+
+print(summary_2025)
+```
+
+```{r}
+# Calculate league averages
+league_wOBA <- platoon_data %>%
+  group_by(year) %>%
+  summarize(league_avg_wOBA = weighted.mean((wOBA_vs_LHP * PA_vs_LHP + wOBA_vs_RHP * PA_vs_RHP) / (PA_vs_LHP + PA_vs_RHP), 
+                                             PA_vs_LHP + PA_vs_RHP, na.rm = TRUE))
+
+wOBA_scale <- 1.20
+
+# Create modeling dataset - FILTER FOR EXTREME/STRONG ONLY
+model_data <- platoon_data %>%
+  left_join(league_wOBA, by = "year") %>%
+  mutate(
+    platoon_advantage = abs(wOBA_vs_LHP - wOBA_vs_RHP),
+    
+    # Classify platoon severity
+    platoon_category = case_when(
+      platoon_advantage >= 0.070 ~ "Extreme",
+      platoon_advantage >= 0.040 ~ "Strong",
+      platoon_advantage >= 0.020 ~ "Moderate",
+      TRUE ~ "Minimal"
+    ),
+    
+    # Optimal PA distribution
+    optimal_pct_good = case_when(
+      platoon_advantage >= 0.070 ~ 0.70,
+      platoon_advantage >= 0.040 ~ 0.60,
+      TRUE ~ 0.50
+    ),
+    
+    # Calculate optimal wOBA and wRAA
+    wOBA_good = pmax(wOBA_vs_LHP, wOBA_vs_RHP),
+    wOBA_bad = pmin(wOBA_vs_LHP, wOBA_vs_RHP),
+    total_PA = PA_vs_LHP + PA_vs_RHP,
+    
+    optimal_wOBA = (wOBA_good * optimal_pct_good + wOBA_bad * (1 - optimal_pct_good)),
+    optimal_wRAA = ((optimal_wOBA - league_avg_wOBA) / wOBA_scale) * total_PA
+  ) %>%
+  # *** KEY FILTER: Only Extreme or Strong platoon players ***
+  filter(
+    platoon_category %in% c("Extreme", "Strong"),
+    !is.na(optimal_wRAA), 
+    total_PA >= 200
+  )
+
+# Check how many players qualify
+model_data %>%
+  count(year, platoon_category)
+```
+
+```{r}
+install.packages("xgboost")
+library(xgboost)
+library(tidyverse)
+```
+
+```{r}
+# Use the model_data from year 2025 (not the lagged version)
+actual_2025_analysis <- model_data %>%
+  filter(year == 2025) %>%
+  mutate(
+    # Calculate actual deployment in 2025
+    actual_PA_good = ifelse(wOBA_vs_LHP > wOBA_vs_RHP, PA_vs_LHP, PA_vs_RHP),
+    actual_PA_bad = ifelse(wOBA_vs_LHP > wOBA_vs_RHP, PA_vs_RHP, PA_vs_LHP),
+    
+    # wOBA values
+    wOBA_good = pmax(wOBA_vs_LHP, wOBA_vs_RHP),
+    wOBA_bad = pmin(wOBA_vs_LHP, wOBA_vs_RHP),
+    wOBA_diff = wOBA_vs_LHP - wOBA_vs_RHP,
+    
+    # Actual wOBA (what they produced in 2025)
+    actual_wOBA_2025 = (wOBA_vs_LHP * PA_vs_LHP + wOBA_vs_RHP * PA_vs_RHP) / total_PA,
+    
+    # Optimal PA distribution if they had been platooned
+    optimal_pct_good = case_when(
+      platoon_category == "Extreme" ~ 0.70,
+      platoon_category == "Strong" ~ 0.60,
+      TRUE ~ 0.50
+    ),
+    
+    # PA reduction from platooning
+    platoon_PA_reduction = case_when(
+      platoon_category == "Extreme" ~ 0.70,
+      platoon_category == "Strong" ~ 0.80,
+      TRUE ~ 1.00
+    ),
+    
+    # Optimal scenario (if they had been platooned in 2025)
+    optimal_total_PA = total_PA * platoon_PA_reduction,
+    optimal_PA_good = optimal_total_PA * optimal_pct_good,
+    optimal_PA_bad = optimal_total_PA * (1 - optimal_pct_good),
+    
+    # What their wOBA would have been if platooned
+    optimal_wOBA_2025 = (wOBA_good * optimal_PA_good + wOBA_bad * optimal_PA_bad) / optimal_total_PA,
+    
+    # Calculate wRAA for both scenarios
+    league_avg_wOBA = 0.315,
+    wOBA_scale = 1.220,
+    
+    actual_wRAA_2025 = ((actual_wOBA_2025 - league_avg_wOBA) / wOBA_scale) * total_PA,
+    optimal_wRAA_2025 = ((optimal_wOBA_2025 - league_avg_wOBA) / wOBA_scale) * optimal_total_PA,
+    
+    # Value that was LEFT ON THE TABLE in 2025
+    runs_lost_2025 = optimal_wRAA_2025 - actual_wRAA_2025,
+    wins_lost_2025 = runs_lost_2025 / 10,
+    
+    # Flag significant opportunities
+    significant_opportunity = runs_lost_2025 > 1.0
+  )
+
+# Create leaderboard
+leaderboard_2025_actual <- actual_2025_analysis %>%
+  filter(significant_opportunity) %>%
+  transmute(
+    Rank = row_number(),
+    Player = player_name,
+   # Team = team_name,
+   # Category = platoon_category,
+  `Platoon wOBA Gain` = round(optimal_wOBA_2025 - actual_wOBA_2025, 3),
+   `2025 wOBA` = round(actual_wOBA_2025, 3),
+   `Platoon Total wOBA` = round(optimal_wOBA_2025, 3),
+   
+    # Their actual 2025 splits
+    `2025 wOBA vs LHP` = round(wOBA_vs_LHP, 3),
+    `2025 wOBA vs RHP` = round(wOBA_vs_RHP, 3),
+    #`wOBA Diff` = round(wOBA_diff, 3),
+    #`Split Size` = round(platoon_advantage, 3),
+    
+    # What actually happened in 2025
+    `Actual PA` = round(total_PA, 0),
+    `Actual PA vs LHP` = round(PA_vs_LHP, 0),
+    `Actual PA vs RHP` = round(PA_vs_RHP, 0),
+    #`Actual PA (Good)` = round(actual_PA_good, 0),
+    #`Actual PA (Bad)` = round(actual_PA_bad, 0),
+    
+    #`2025 wRAA` = round(actual_wRAA_2025, 1),
+    
+    # What WOULD HAVE happened if platooned
+    `Platoon Total PA` = round(optimal_total_PA, 0),
+    `Platoon PA LHP` = round(optimal_PA_good, 0),
+    `Platoon PA RHP` = round(optimal_PA_bad, 0),
+    
+    #`Platoon Total wRAA` = round(optimal_wRAA_2025, 1),
+    
+    # Value left on table
+    
+    #`Runs Lost` = round(runs_lost_2025, 1),
+    #`Wins Lost` = round(wins_lost_2025, 2),
+    
+    #`PA Reduction` = round(total_PA - optimal_total_PA, 0)
+  ) %>%
+  arrange(desc(`Platoon wOBA Gain`))
+
+# Add rank
+leaderboard_2025_actual$Rank <- 1:nrow(leaderboard_2025_actual)
+
+cat("\n========================================\n")
+cat("2025 ACTUAL PLATOON OPPORTUNITY ANALYSIS\n")
+cat("What Actually Happened vs What Could Have Been\n")
+cat("========================================\n\n")
+
+print(head(leaderboard_2025_actual, 10))
+```
+
+```{r}
+# Create dataset for predicting wOBA
+wOBA_model_data <- platoon_data %>%
+  arrange(player_id, year) %>%
+  group_by(player_id) %>%
+  mutate(
+   prior_wOBA_vs_LHP = lag(wOBA_vs_LHP, 1),
+    prior_wOBA_vs_RHP = lag(wOBA_vs_RHP, 1),
+   
+    # Total PA across two years for threshold
+    total_PA_2yr_LHP = lag(PA_vs_LHP, 1) + lag(PA_vs_LHP, 2),
+    total_PA_2yr_RHP = lag(PA_vs_RHP, 1) + lag(PA_vs_RHP, 2),
+    
+    # 2-year averages wOBA (no leakage)
+    avg_2yr_wOBA_LHP = (lag(wOBA_vs_LHP, 1) + lag(wOBA_vs_LHP, 2)) / 2,
+    avg_2yr_wOBA_RHP = (lag(wOBA_vs_RHP, 1) + lag(wOBA_vs_RHP, 2)) / 2,
+    
+    # K% prior years
+   avg_2yr_K_pct_LHP = (lag(K_pct_vs_LHP, 1) + lag(K_pct_vs_LHP, 2)) / 2,
+    avg_2yr_K_pct_RHP = (lag(K_pct_vs_RHP, 1) + lag(K_pct_vs_RHP, 2)) / 2,
+    
+    # BB% prior years
+avg_2yr_BB_pct_LHP = (lag(BB_pct_vs_LHP, 1) + lag(BB_pct_vs_LHP, 2)) / 2,
+    avg_2yr_BB_pct_RHP = (lag(BB_pct_vs_RHP, 1) + lag(BB_pct_vs_RHP, 2)) / 2,
+
+    # BABIP prior years
+    #prior_BABIP_vs_LHP = lag(BABIP_vs_LHP, 1),
+    #prior_BABIP_vs_RHP = lag(BABIP_vs_RHP, 1),
+    avg_2yr_BABIP_LHP = (lag(BABIP_vs_LHP, 1) + lag(BABIP_vs_LHP, 2)) / 2,
+    avg_2yr_BABIP_RHP = (lag(BABIP_vs_RHP, 1) + lag(BABIP_vs_RHP, 2)) / 2,
+    
+  #LHP Stuff to boost R2
+    prior_K_pct_vs_LHP = lag(K_pct_vs_LHP, 1),
+    prior_BB_pct_vs_LHP = lag(BB_pct_vs_LHP, 1),
+    prior_BABIP_vs_LHP = lag(BABIP_vs_LHP, 1),
+    
+    # Overall performance
+    overall_wOBA = (wOBA_vs_LHP * PA_vs_LHP + wOBA_vs_RHP * PA_vs_RHP) / (PA_vs_LHP + PA_vs_RHP),
+    prior_overall_wOBA = lag(overall_wOBA, 1)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(prior_wOBA_vs_LHP))
+
+# Check sample sizes
+wOBA_model_data %>%
+  count(year)
+
+train_wOBA <- wOBA_model_data %>%
+  filter(year %in% 2021:2024,
+         total_PA_2yr_LHP >= 50,
+         total_PA_2yr_RHP >= 200) %>%
+  select(
+    wOBA_vs_LHP, wOBA_vs_RHP, prior_K_pct_vs_LHP,
+    prior_wOBA_vs_LHP, prior_wOBA_vs_RHP, prior_BB_pct_vs_LHP,  prior_BABIP_vs_LHP, 
+    avg_2yr_wOBA_LHP, avg_2yr_wOBA_RHP,
+    avg_2yr_K_pct_LHP, avg_2yr_K_pct_RHP,
+    avg_2yr_BB_pct_LHP, avg_2yr_BB_pct_RHP,
+    #prior_BABIP_vs_LHP, #prior_BABIP_vs_RHP,
+    avg_2yr_BABIP_LHP, avg_2yr_BABIP_RHP,
+    prior_overall_wOBA
+  ) %>%
+  na.omit()
+
+test_wOBA <- wOBA_model_data %>%
+  filter(year == 2025,
+         total_PA_2yr_LHP >= 50,
+         total_PA_2yr_RHP >= 200) %>%
+  group_by(player_id) %>%
+  slice_max(PA_vs_LHP + PA_vs_RHP, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(
+    player_name, player_id, team_name,
+    wOBA_vs_LHP, wOBA_vs_RHP, prior_K_pct_vs_LHP,
+    prior_wOBA_vs_LHP, prior_wOBA_vs_RHP, prior_BB_pct_vs_LHP, prior_BABIP_vs_LHP,
+    avg_2yr_wOBA_LHP, avg_2yr_wOBA_RHP,
+    avg_2yr_K_pct_LHP, avg_2yr_K_pct_RHP,
+    avg_2yr_BB_pct_LHP, avg_2yr_BB_pct_RHP,
+    avg_2yr_BABIP_LHP, avg_2yr_BABIP_RHP,
+    prior_overall_wOBA
+  ) %>%
+  na.omit()
+
+cat("Training samples:", nrow(train_wOBA), "\n")
+cat("Test samples:", nrow(test_wOBA), "\n")
+```
+
+```{r}
+# Prepare matrices for wOBA vs LHP
+train_matrix_LHP <- as.matrix(train_wOBA %>% select(-wOBA_vs_LHP, -wOBA_vs_RHP))
+train_label_LHP <- train_wOBA$wOBA_vs_LHP
+
+test_matrix_LHP <- as.matrix(test_wOBA %>% 
+  select(-player_name, -player_id, -team_name, -wOBA_vs_LHP, -wOBA_vs_RHP))
+
+dtrain_LHP <- xgb.DMatrix(data = train_matrix_LHP, label = train_label_LHP)
+dtest_LHP <- xgb.DMatrix(data = test_matrix_LHP)
+
+set.seed(123)
+cv_model_LHP <- xgb.cv(
+  params = params_wOBA,
+  data = dtrain_LHP,
+  nrounds = 500,
+  nfold = 5,
+  early_stopping_rounds = 50,
+  verbose = 1,
+  print_every_n = 50
+)
+
+best_iteration_LHP <- cv_model_LHP$best_iteration
+if (is.null(best_iteration_LHP) || length(best_iteration_LHP) == 0) {
+  best_iteration_LHP <- which.min(cv_model_LHP$evaluation_log$test_rmse_mean)
+}
+
+xgb_model_LHP <- xgb.train(
+  params = params_wOBA,
+  data = dtrain_LHP,
+  nrounds = best_iteration_LHP,
+  verbose = 0
+)
+
+test_wOBA$predicted_wOBA_vs_LHP <- predict(xgb_model_LHP, dtest_LHP)
+
+rmse_LHP <- sqrt(mean((test_wOBA$wOBA_vs_LHP - test_wOBA$predicted_wOBA_vs_LHP)^2))
+r2_LHP <- cor(test_wOBA$wOBA_vs_LHP, test_wOBA$predicted_wOBA_vs_LHP)^2
+
+cat("wOBA vs LHP Model Performance:\n")
+cat("  RMSE:", round(rmse_LHP, 4), "\n")
+cat("  R²:", round(r2_LHP, 4), "\n")
+```
+
+```{r}
+# Prepare matrices for wOBA vs RHP
+train_matrix_RHP <- as.matrix(train_wOBA %>% select(-wOBA_vs_LHP, -wOBA_vs_RHP))
+train_label_RHP <- train_wOBA$wOBA_vs_RHP
+
+test_matrix_RHP <- as.matrix(test_wOBA %>% 
+  select(-player_name, -player_id, -team_name, -wOBA_vs_LHP, -wOBA_vs_RHP, -predicted_wOBA_vs_LHP))
+
+dtrain_RHP <- xgb.DMatrix(data = train_matrix_RHP, label = train_label_RHP)
+dtest_RHP <- xgb.DMatrix(data = test_matrix_RHP)
+
+set.seed(123)
+cv_model_RHP <- xgb.cv(
+  params = params_wOBA,
+  data = dtrain_RHP,
+  nrounds = 500,
+  nfold = 5,
+  early_stopping_rounds = 50,
+  verbose = 1,
+  print_every_n = 50
+)
+
+best_iteration_RHP <- cv_model_RHP$best_iteration
+if (is.null(best_iteration_RHP) || length(best_iteration_RHP) == 0) {
+  best_iteration_RHP <- which.min(cv_model_RHP$evaluation_log$test_rmse_mean)
+}
+
+xgb_model_RHP <- xgb.train(
+  params = params_wOBA,
+  data = dtrain_RHP,
+  nrounds = best_iteration_RHP,
+  verbose = 0
+)
+
+test_wOBA$predicted_wOBA_vs_RHP <- predict(xgb_model_RHP, dtest_RHP)
+
+rmse_RHP <- sqrt(mean((test_wOBA$wOBA_vs_RHP - test_wOBA$predicted_wOBA_vs_RHP)^2))
+r2_RHP <- cor(test_wOBA$wOBA_vs_RHP, test_wOBA$predicted_wOBA_vs_RHP)^2
+
+cat("wOBA vs RHP Model Performance:\n")
+cat("  RMSE:", round(rmse_RHP, 4), "\n")
+cat("  R²:", round(r2_RHP, 4), "\n")
+```
+
+```{r}
+wOBA_validation_with_splits <- test_wOBA %>%
+  transmute(
+    Player = player_name,
+    Team = team_name,
+    
+    # Actual 2025
+    `Actual wOBA vs LHP` = round(wOBA_vs_LHP, 3),
+    `Actual wOBA vs RHP` = round(wOBA_vs_RHP, 3),
+    `Actual Split` = round(wOBA_vs_LHP - wOBA_vs_RHP, 3),
+    
+    # Predicted 2025
+    `Pred wOBA vs LHP` = round(predicted_wOBA_vs_LHP, 3),
+    `Pred wOBA vs RHP` = round(predicted_wOBA_vs_RHP, 3),
+    `Pred Split` = round(predicted_wOBA_vs_LHP - predicted_wOBA_vs_RHP, 3),
+    
+    # Errors
+    `Error LHP` = round(wOBA_vs_LHP - predicted_wOBA_vs_LHP, 3),
+    `Error RHP` = round(wOBA_vs_RHP - predicted_wOBA_vs_RHP, 3),
+    `Abs Error LHP` = round(abs(wOBA_vs_LHP - predicted_wOBA_vs_LHP), 3),
+    `Abs Error RHP` = round(abs(wOBA_vs_RHP - predicted_wOBA_vs_RHP), 3)
+  ) %>%
+  arrange(desc(`Abs Error LHP`))
+
+# Best predictions (smallest error)
+cat("========== BEST PREDICTIONS ==========\n")
+print(wOBA_validation_with_splits %>% 
+        arrange(`Abs Error LHP`) %>% 
+        head(20))
+
+# Worst predictions (largest error)
+cat("\n========== WORST PREDICTIONS ==========\n")
+print(wOBA_validation_with_splits %>% 
+        arrange(desc(`Abs Error LHP`)) %>% 
+        head(20))
+
+# Summary stats
+cat("\n========== SUMMARY ==========\n")
+summary_stats <- wOBA_validation_with_splits %>%
+  summarize(
+    `Sample Size` = n(),
+    `RMSE LHP` = round(sqrt(mean(`Error LHP`^2)), 4),
+    `MAE LHP` = round(mean(`Abs Error LHP`), 4),
+    `R² LHP` = round(r2_LHP, 4),
+    `RMSE RHP` = round(sqrt(mean(`Error RHP`^2)), 4),
+    `MAE RHP` = round(mean(`Abs Error RHP`), 4),
+    `R² RHP` = round(r2_RHP, 4)
+  )
+print(t(summary_stats))
+```
+
+```{r}
+# Get feature importance for both models
+importance_LHP <- xgb.importance(
+  feature_names = colnames(train_matrix_LHP),
+  model = xgb_model_LHP
+)
+
+importance_RHP <- xgb.importance(
+  feature_names = colnames(train_matrix_RHP),
+  model = xgb_model_RHP
+)
+
+# LHP importance plot
+p_LHP <- ggplot(importance_LHP, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  geom_text(aes(label = round(Gain, 3)), hjust = -0.1, size = 3) +
+  coord_flip() +
+  labs(
+    title = "Feature Importance: wOBA vs LHP Model",
+    subtitle = "Trained on 2021-2024 | Validated on 2025",
+    x = "Feature",
+    y = "Gain",
+    caption = "Higher gain = more important for predictions"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    panel.grid.minor = element_blank()
+  )
+
+# RHP importance plot
+p_RHP <- ggplot(importance_RHP, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "darkgreen", alpha = 0.8) +
+  geom_text(aes(label = round(Gain, 3)), hjust = -0.1, size = 3) +
+  coord_flip() +
+  labs(
+    title = "Feature Importance: wOBA vs RHP Model",
+    subtitle = "Trained on 2021-2024 | Validated on 2025",
+    x = "Feature",
+    y = "Gain",
+    caption = "Higher gain = more important for predictions"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    panel.grid.minor = element_blank()
+  )
+
+# Print top features
+cat("========== TOP FEATURES: wOBA vs LHP ==========\n")
+print(head(importance_LHP, 20))
+
+cat("\n========== TOP FEATURES: wOBA vs RHP ==========\n")
+print(head(importance_RHP, 20))
+
+# Display plots
+library(gridExtra)
+grid.arrange(p_LHP, p_RHP, ncol = 2)
+
+write_csv(importance_LHP, "feature_importance_LHP.csv")
+write_csv(importance_RHP, "feature_importance_RHP.csv")
+```
+
+```{r}
+xgb_leaderboard_2025 <- test_wOBA %>%
+  mutate(
+    # Predicted split size
+    predicted_split = predicted_wOBA_vs_LHP - predicted_wOBA_vs_RHP,
+    predicted_split_size = abs(predicted_split),
+    
+    # Classify platoon severity based on PREDICTED splits
+    platoon_category = case_when(
+      predicted_split_size >= 0.070 ~ "Extreme",
+      predicted_split_size >= 0.040 ~ "Strong",
+      predicted_split_size >= 0.020 ~ "Moderate",
+      TRUE ~ "Minimal"
+    ),
+    
+    # Optimal PA distribution
+    optimal_pct_good = case_when(
+      platoon_category == "Extreme" ~ 0.70,
+      platoon_category == "Strong" ~ 0.60,
+      TRUE ~ 0.50
+    ),
+    
+    # PA reduction from platooning
+    platoon_PA_reduction = case_when(
+      platoon_category == "Extreme" ~ 0.70,
+      platoon_category == "Strong" ~ 0.80,
+      TRUE ~ 1.00
+    ),
+    
+    # Total PA from actual 2025
+    #total_PA = PA_vs_LHP + PA_vs_RHP,
+    
+    # Actual wOBA (from real 2025 data)
+    actual_wOBA_2025 = (wOBA_vs_LHP * PA_vs_LHP + wOBA_vs_RHP * PA_vs_RHP) / total_PA,
+    
+    # Platooned total PA (reduced)
+    platoon_total_PA = total_PA * platoon_PA_reduction,
+    
+    # Identify good/bad matchup from PREDICTED splits
+    wOBA_good = pmax(predicted_wOBA_vs_LHP, predicted_wOBA_vs_RHP),
+    wOBA_bad = pmin(predicted_wOBA_vs_LHP, predicted_wOBA_vs_RHP),
+    
+    # Optimal PA distribution
+    platoon_PA_good = platoon_total_PA * optimal_pct_good,
+    platoon_PA_bad = platoon_total_PA * (1 - optimal_pct_good),
+    
+    # Actual PA in good matchup (from real 2025 usage)
+    actual_PA_good = ifelse(predicted_split > 0, PA_vs_LHP, PA_vs_RHP),
+    actual_PA_bad = ifelse(predicted_split > 0, PA_vs_RHP, PA_vs_LHP),
+    
+    # Platoon wOBA using predicted splits
+    platoon_total_wOBA = (wOBA_good * platoon_PA_good + wOBA_bad * platoon_PA_bad) / platoon_total_PA,
+    
+    # wOBA gain
+    wOBA_gain = platoon_total_wOBA - actual_wOBA_2025
+  ) %>%
+  filter(
+    platoon_category %in% c("Extreme", "Strong"),
+    wOBA_gain > 0
+  ) %>%
+  transmute(
+    Rank = row_number(),
+    Player = player_name,
+    Team = team_name,
+    Category = platoon_category,
+    `Platoon wOBA Gain` = round(wOBA_gain, 3),
+    `2025 wOBA` = round(actual_wOBA_2025, 3),
+    `Platoon Total wOBA` = round(platoon_total_wOBA, 3),
+    `Pred wOBA Split (LHP-RHP)` = round(predicted_split, 3),
+    `2025 PA` = round(total_PA, 0),
+    `Actual PA vs LHP` = round(PA_vs_LHP, 0),
+    `Actual PA vs RHP` = round(PA_vs_RHP, 0),
+    `Platoon Total PA` = round(platoon_total_PA, 0),
+    `Platoon PA LHP` = round(ifelse(predicted_split > 0, platoon_PA_good, platoon_PA_bad), 0),
+    `Platoon PA RHP` = round(ifelse(predicted_split > 0, platoon_PA_bad, platoon_PA_good), 0)
+  ) %>%
+  arrange(desc(`Platoon wOBA Gain`))
+
+xgb_leaderboard_2025$Rank <- 1:nrow(xgb_leaderboard_2025)
+
+cat("\n========================================\n")
+cat("2025 PLATOON LEADERBOARD (xGBoost Predicted Splits)\n")
+cat("========================================\n\n")
+print(head(xgb_leaderboard_2025, 25))
+```
+
+```{r}
+# Calculate regression line stats for LHP
+fit_LHP <- lm(predicted_wOBA_vs_LHP ~ wOBA_vs_LHP, data = test_wOBA)
+slope_LHP <- round(coef(fit_LHP)[2], 3)
+intercept_LHP <- round(coef(fit_LHP)[1], 4)
+
+# LHP scatter plot
+p_scatter_LHP <- ggplot(test_wOBA, aes(x = wOBA_vs_LHP, y = predicted_wOBA_vs_LHP)) +
+  geom_point(color = "gray40", alpha = 0.7, size = 2, shape = 8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "solid", 
+              color = "black", linewidth = 1) +
+  geom_smooth(method = "lm", se = FALSE, color = "red", 
+              linetype = "dashed", linewidth = 0.8) +
+  annotate("text", 
+           x = min(test_wOBA$wOBA_vs_LHP) + 0.01,
+           y = max(test_wOBA$predicted_wOBA_vs_LHP) - 0.01,
+           label = paste0("y = ", slope_LHP, "x + ", intercept_LHP,
+                         "\nR² = ", round(r2_LHP, 4),
+                         "\nRMSE = ", round(rmse_LHP, 4)),
+           hjust = 0, vjust = 1, size = 4, fontface = "bold") +
+  labs(
+    title = "xGBoost Model Validation: wOBA vs LHP (2025)",
+    subtitle = paste0("Trained on 2021-2024 | N = ", nrow(test_wOBA), " players"),
+    x = "Actual wOBA vs LHP (2025)",
+    y = "Predicted wOBA vs LHP"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white")
+  )
+
+# Calculate regression line stats for RHP
+fit_RHP <- lm(predicted_wOBA_vs_RHP ~ wOBA_vs_RHP, data = test_wOBA)
+slope_RHP <- round(coef(fit_RHP)[2], 3)
+intercept_RHP <- round(coef(fit_RHP)[1], 4)
+
+# RHP scatter plot
+p_scatter_RHP <- ggplot(test_wOBA, aes(x = wOBA_vs_RHP, y = predicted_wOBA_vs_RHP)) +
+  geom_point(color = "gray40", alpha = 0.7, size = 2, shape = 8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "solid", 
+              color = "black", linewidth = 1) +
+  geom_smooth(method = "lm", se = FALSE, color = "red", 
+              linetype = "dashed", linewidth = 0.8) +
+  annotate("text", 
+           x = min(test_wOBA$wOBA_vs_RHP) + 0.01,
+           y = max(test_wOBA$predicted_wOBA_vs_RHP) - 0.01,
+           label = paste0("y = ", slope_RHP, "x + ", intercept_RHP,
+                         "\nR² = ", round(r2_RHP, 4),
+                         "\nRMSE = ", round(rmse_RHP, 4)),
+           hjust = 0, vjust = 1, size = 4, fontface = "bold") +
+  labs(
+    title = "xGBoost Model Validation: wOBA vs RHP (2025)",
+    subtitle = paste0("Trained on 2021-2024 | N = ", nrow(test_wOBA), " players"),
+    x = "Actual wOBA vs RHP (2025)",
+    y = "Predicted wOBA vs RHP"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white")
+  )
+
+# Display both
+print(p_scatter_LHP)
+print(p_scatter_RHP)
+
+write_csv(test_wOBA %>% 
+  select(player_name, team_name, wOBA_vs_LHP, predicted_wOBA_vs_LHP),
+  "scatter_data_LHP.csv")
+
+write_csv(test_wOBA %>% 
+  select(player_name, team_name, wOBA_vs_RHP, predicted_wOBA_vs_RHP),
+  "scatter_data_RHP.csv")
+
+```
+
+```{r}
+performance_metrics <- data.frame(
+  Metric = c(
+    "R2 (R-squared)",
+    "Correlation",
+    "RMSE (wOBA points)",
+    "MAE (wOBA points)",
+    "Mean Error",
+    "Median Error",
+    "Std Dev of Errors",
+    "Min Error",
+    "Max Error",
+    "MAPE (%)",
+    "% Within +/-.010",
+    "% Within +/-.030",
+    "% Within +/-.050",
+    "Slope of Fit Line",
+    "Intercept of Fit Line"
+  ),
+  
+  LHP_Model = c(
+    round(r2_LHP, 4),
+    round(cor(test_wOBA$wOBA_vs_LHP, test_wOBA$predicted_wOBA_vs_LHP), 4),
+    round(rmse_LHP, 4),
+    round(mean(abs(test_wOBA$wOBA_vs_LHP - test_wOBA$predicted_wOBA_vs_LHP)), 4),
+    round(mean(test_wOBA$wOBA_vs_LHP - test_wOBA$predicted_wOBA_vs_LHP), 4),
+    round(median(test_wOBA$wOBA_vs_LHP - test_wOBA$predicted_wOBA_vs_LHP), 4),
+    round(sd(test_wOBA$wOBA_vs_LHP - test_wOBA$predicted_wOBA_vs_LHP), 4),
+    round(min(test_wOBA$wOBA_vs_LHP - test_wOBA$predicted_wOBA_vs_LHP), 4),
+    round(max(test_wOBA$wOBA_vs_LHP - test_wOBA$predicted_wOBA_vs_LHP), 4),
+    round(mean(abs((test_wOBA$wOBA_vs_LHP - test_wOBA$predicted_wOBA_vs_LHP) / test_wOBA$wOBA_vs_LHP)) * 100, 2),
+    round(sum(abs(test_wOBA$wOBA_vs_LHP - test_wOBA$predicted_wOBA_vs_LHP) < 0.010) / nrow(test_wOBA) * 100, 1),
+    round(sum(abs(test_wOBA$wOBA_vs_LHP - test_wOBA$predicted_wOBA_vs_LHP) < 0.030) / nrow(test_wOBA) * 100, 1),
+    round(sum(abs(test_wOBA$wOBA_vs_LHP - test_wOBA$predicted_wOBA_vs_LHP) < 0.050) / nrow(test_wOBA) * 100, 1),
+    round(coef(lm(predicted_wOBA_vs_LHP ~ wOBA_vs_LHP, data = test_wOBA))[2], 4),
+    round(coef(lm(predicted_wOBA_vs_LHP ~ wOBA_vs_LHP, data = test_wOBA))[1], 4)
+  ),
+  
+  RHP_Model = c(
+    round(r2_RHP, 4),
+    round(cor(test_wOBA$wOBA_vs_RHP, test_wOBA$predicted_wOBA_vs_RHP), 4),
+    round(rmse_RHP, 4),
+    round(mean(abs(test_wOBA$wOBA_vs_RHP - test_wOBA$predicted_wOBA_vs_RHP)), 4),
+    round(mean(test_wOBA$wOBA_vs_RHP - test_wOBA$predicted_wOBA_vs_RHP), 4),
+    round(median(test_wOBA$wOBA_vs_RHP - test_wOBA$predicted_wOBA_vs_RHP), 4),
+    round(sd(test_wOBA$wOBA_vs_RHP - test_wOBA$predicted_wOBA_vs_RHP), 4),
+    round(min(test_wOBA$wOBA_vs_RHP - test_wOBA$predicted_wOBA_vs_RHP), 4),
+    round(max(test_wOBA$wOBA_vs_RHP - test_wOBA$predicted_wOBA_vs_RHP), 4),
+    round(mean(abs((test_wOBA$wOBA_vs_RHP - test_wOBA$predicted_wOBA_vs_RHP) / test_wOBA$wOBA_vs_RHP)) * 100, 2),
+    round(sum(abs(test_wOBA$wOBA_vs_RHP - test_wOBA$predicted_wOBA_vs_RHP) < 0.010) / nrow(test_wOBA) * 100, 1),
+    round(sum(abs(test_wOBA$wOBA_vs_RHP - test_wOBA$predicted_wOBA_vs_RHP) < 0.030) / nrow(test_wOBA) * 100, 1),
+    round(sum(abs(test_wOBA$wOBA_vs_RHP - test_wOBA$predicted_wOBA_vs_RHP) < 0.050) / nrow(test_wOBA) * 100, 1),
+    round(coef(lm(predicted_wOBA_vs_RHP ~ wOBA_vs_RHP, data = test_wOBA))[2], 4),
+    round(coef(lm(predicted_wOBA_vs_RHP ~ wOBA_vs_RHP, data = test_wOBA))[1], 4)
+  )
+)
+
+print(performance_metrics)
+```
+
+```{r}
+# Full training data including 2025
+train_wOBA_full <- wOBA_model_data %>%
+  filter(year %in% 2021:2025,
+         total_PA_2yr_LHP >= 50,
+         total_PA_2yr_RHP >= 200) %>%
+  select(
+    wOBA_vs_LHP, wOBA_vs_RHP, prior_K_pct_vs_LHP,
+    prior_wOBA_vs_LHP, prior_wOBA_vs_RHP, prior_BB_pct_vs_LHP, prior_BABIP_vs_LHP,
+    avg_2yr_wOBA_LHP, avg_2yr_wOBA_RHP,
+    avg_2yr_K_pct_LHP, avg_2yr_K_pct_RHP,
+    avg_2yr_BB_pct_LHP, avg_2yr_BB_pct_RHP,
+    #prior_BABIP_vs_LHP, prior_BABIP_vs_RHP,
+    avg_2yr_BABIP_LHP, avg_2yr_BABIP_RHP,
+    prior_overall_wOBA
+  ) %>%
+  na.omit()
+
+# 2026 prediction data — uses 2025 row as input
+predict_2026 <- wOBA_model_data %>%
+  filter(year == 2025,
+         total_PA_2yr_LHP >= 50,
+         total_PA_2yr_RHP >= 200) %>%
+  group_by(player_id) %>%
+  slice_max(PA_vs_LHP + PA_vs_RHP, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(
+    player_name, player_id, team_name,
+    wOBA_vs_LHP, wOBA_vs_RHP, prior_K_pct_vs_LHP,
+    PA_vs_LHP, PA_vs_RHP,
+    prior_wOBA_vs_LHP, prior_wOBA_vs_RHP, prior_BB_pct_vs_LHP, prior_BABIP_vs_LHP,
+    avg_2yr_wOBA_LHP, avg_2yr_wOBA_RHP,
+    avg_2yr_K_pct_LHP, avg_2yr_K_pct_RHP,
+    avg_2yr_BB_pct_LHP, avg_2yr_BB_pct_RHP,
+    avg_2yr_BABIP_LHP, avg_2yr_BABIP_RHP,
+    prior_overall_wOBA
+  ) %>%
+  na.omit()
+
+cat("Full training samples:", nrow(train_wOBA_full), "\n")
+cat("2026 prediction players:", nrow(predict_2026), "\n")
+```
+
+```{r}
+train_matrix_LHP_full <- as.matrix(train_wOBA_full %>% select(-wOBA_vs_LHP, -wOBA_vs_RHP))
+train_label_LHP_full <- train_wOBA_full$wOBA_vs_LHP
+
+predict_matrix_2026 <- as.matrix(predict_2026 %>%
+  select(-player_name, -player_id, -team_name,
+         -wOBA_vs_LHP, -wOBA_vs_RHP,
+         -PA_vs_LHP, -PA_vs_RHP))
+
+dtrain_LHP_full <- xgb.DMatrix(data = train_matrix_LHP_full, label = train_label_LHP_full)
+d2026 <- xgb.DMatrix(data = predict_matrix_2026)
+
+set.seed(123)
+cv_2026_LHP <- xgb.cv(
+  params = params_wOBA,
+  data = dtrain_LHP_full,
+  nrounds = 500,
+  nfold = 5,
+  early_stopping_rounds = 50,
+  verbose = 1,
+  print_every_n = 50
+)
+
+best_iter_LHP_2026 <- cv_2026_LHP$best_iteration
+if (is.null(best_iter_LHP_2026) || length(best_iter_LHP_2026) == 0) {
+  best_iter_LHP_2026 <- which.min(cv_2026_LHP$evaluation_log$test_rmse_mean)
+}
+
+xgb_model_LHP_2026 <- xgb.train(
+  params = params_wOBA,
+  data = dtrain_LHP_full,
+  nrounds = best_iter_LHP_2026,
+  verbose = 0
+)
+
+predict_2026$predicted_2026_wOBA_vs_LHP <- predict(xgb_model_LHP_2026, d2026)
+cat("LHP 2026 predictions generated\n")
+
+# ============================================
+# RETRAIN RHP MODEL
+# ============================================
+train_matrix_RHP_full <- as.matrix(train_wOBA_full %>% select(-wOBA_vs_LHP, -wOBA_vs_RHP))
+train_label_RHP_full <- train_wOBA_full$wOBA_vs_RHP
+
+dtrain_RHP_full <- xgb.DMatrix(data = train_matrix_RHP_full, label = train_label_RHP_full)
+
+set.seed(123)
+cv_2026_RHP <- xgb.cv(
+  params = params_wOBA,
+  data = dtrain_RHP_full,
+  nrounds = 500,
+  nfold = 5,
+  early_stopping_rounds = 50,
+  verbose = 1,
+  print_every_n = 50
+)
+
+best_iter_RHP_2026 <- cv_2026_RHP$best_iteration
+if (is.null(best_iter_RHP_2026) || length(best_iter_RHP_2026) == 0) {
+  best_iter_RHP_2026 <- which.min(cv_2026_RHP$evaluation_log$test_rmse_mean)
+}
+
+xgb_model_RHP_2026 <- xgb.train(
+  params = params_wOBA,
+  data = dtrain_RHP_full,
+  nrounds = best_iter_RHP_2026,
+  verbose = 0
+)
+
+predict_2026$predicted_2026_wOBA_vs_RHP <- predict(xgb_model_RHP_2026, d2026)
+cat("RHP 2026 predictions generated\n")
+```
+
+```{r}
+leaderboard_2026 <- predict_2026 %>%
+  mutate(
+    actual_split = wOBA_vs_LHP - wOBA_vs_RHP,
+actual_split_size = abs(wOBA_vs_LHP - wOBA_vs_RHP),
+
+platoon_category = case_when(
+  actual_split_size >= 0.070 ~ "Extreme",
+  actual_split_size >= 0.040 ~ "Strong",
+  actual_split_size >= 0.020 ~ "Moderate",
+  TRUE ~ "Minimal"
+),
+    
+    optimal_pct_good = case_when(
+      platoon_category == "Extreme" ~ 0.70,
+      platoon_category == "Strong" ~ 0.60,
+      TRUE ~ 0.50
+    ),
+    
+    platoon_PA_reduction = case_when(
+      platoon_category == "Extreme" ~ 0.70,
+      platoon_category == "Strong" ~ 0.80,
+      TRUE ~ 1.00
+    ),
+    
+    # 2025 actual usage as baseline for 2026
+total_PA_2025 = PA_vs_LHP + PA_vs_RHP,
+pct_PA_vs_LHP_2025 = PA_vs_LHP / total_PA_2025,
+pct_PA_vs_RHP_2025 = PA_vs_RHP / total_PA_2025,
+projected_total_PA_2026 = total_PA_2025,
+
+# Use actual 2025 split to determine good/bad matchup
+actual_split = wOBA_vs_LHP - wOBA_vs_RHP,
+actual_split_size = abs(actual_split),
+
+# Suboptimal (same deployment as 2025)
+sub_PA_vs_LHP = projected_total_PA_2026 * pct_PA_vs_LHP_2025,
+sub_PA_vs_RHP = projected_total_PA_2026 * pct_PA_vs_RHP_2025,
+wOBA_good = pmax(predicted_2026_wOBA_vs_LHP, predicted_2026_wOBA_vs_RHP),
+wOBA_bad = pmin(predicted_2026_wOBA_vs_LHP, predicted_2026_wOBA_vs_RHP),
+sub_PA_good = ifelse(actual_split > 0, sub_PA_vs_LHP, sub_PA_vs_RHP),
+sub_PA_bad = ifelse(actual_split > 0, sub_PA_vs_RHP, sub_PA_vs_LHP),
+sub_wOBA = (wOBA_good * sub_PA_good + wOBA_bad * sub_PA_bad) / projected_total_PA_2026,
+
+# Platooned scenario
+plat_total_PA = projected_total_PA_2026 * platoon_PA_reduction,
+plat_PA_good = plat_total_PA * optimal_pct_good,
+plat_PA_bad = plat_total_PA * (1 - optimal_pct_good),
+plat_wOBA = (wOBA_good * plat_PA_good + wOBA_bad * plat_PA_bad) / plat_total_PA,
+
+wOBA_gain = plat_wOBA - sub_wOBA
+
+  ) %>%
+  filter(
+   # platoon_category %in% c("Extreme", "Strong"),
+    wOBA_gain > 0
+  ) %>%
+  transmute(
+    Rank = row_number(),
+    Player = player_name,
+    Team = team_name,
+    Category = platoon_category,
+    `Pred wOBA vs LHP` = round(predicted_2026_wOBA_vs_LHP, 3),
+    `Pred wOBA vs RHP` = round(predicted_2026_wOBA_vs_RHP, 3),
+    `Sub: Total PA` = round(projected_total_PA_2026, 0),
+    `Sub: PA (Good)` = round(sub_PA_good, 0),
+    `Sub: PA (Bad)` = round(sub_PA_bad, 0),
+    `Sub: wOBA` = round(sub_wOBA, 3),
+    `Plat: Total PA` = round(plat_total_PA, 0),
+    `Plat: PA (Good)` = round(plat_PA_good, 0),
+    `Plat: PA (Bad)` = round(plat_PA_bad, 0),
+    `Plat: wOBA` = round(plat_wOBA, 3),
+    `wOBA Gain` = round(wOBA_gain, 3)
+  ) %>%
+  arrange(desc(`wOBA Gain`))
+
+leaderboard_2026$Rank <- 1:nrow(leaderboard_2026)
+
+cat("\n========== 2026 PLATOON LEADERBOARD ==========\n")
+print(head(leaderboard_2026, 25))
+
+write_csv(leaderboard_2026, "leaderboard_2026.csv")
+cat("\nExported to leaderboard_2026.csv\n")
+```
+
+```{r}
+platoon_data %>%
+  filter(year == 2025) %>%
+  mutate(
+    split_size = abs(wOBA_vs_LHP - wOBA_vs_RHP),
+    total_PA = PA_vs_LHP + PA_vs_RHP,
+    pct_vs_LHP = PA_vs_LHP / total_PA
+  ) %>%
+  filter(split_size >= 0.050) %>%
+  arrange(desc(split_size)) %>%
+  select(player_name, team_name, wOBA_vs_LHP, wOBA_vs_RHP, 
+         split_size, PA_vs_LHP, PA_vs_RHP, pct_vs_LHP) %>%
+  head(20)
+```
